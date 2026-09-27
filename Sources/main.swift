@@ -81,7 +81,8 @@ final class VolumeController {
     }
 
     func step(up: Bool, fine: Bool) {
-        let step = fine ? 1.0 / 64 : 1.0 / 16
+        // 5 monitor units per press (5% on a 0–100 monitor), 1 unit with ⌥⇧.
+        let step = (fine ? 1.0 : 5.0) / maxValue
         if muted { muted = false; volume = volumeBeforeMute }
         let snapped = (volume / step).rounded() * step
         set(max(0, min(1, snapped + (up ? step : -step))))
@@ -170,17 +171,54 @@ enum MediaKeys {
 
 // MARK: - On-screen HUD
 
+/// Volume bar that can be clicked, dragged and scrolled.
 final class LevelView: NSView {
     var level: Double = 0 { didSet { needsDisplay = true } }
+    var onChange: ((Double) -> Void)?
+    private let barHeight: CGFloat = 8
+
+    private var barRect: NSRect {
+        NSRect(x: 0, y: (bounds.height - barHeight) / 2, width: bounds.width, height: barHeight)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
-        let track = NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2, yRadius: bounds.height / 2)
+        let bar = barRect
+        let r = bar.height / 2
         NSColor.labelColor.withAlphaComponent(0.15).setFill()
-        track.fill()
+        NSBezierPath(roundedRect: bar, xRadius: r, yRadius: r).fill()
         guard level > 0 else { return }
-        var fill = bounds
-        fill.size.width = max(bounds.height, bounds.width * level)
+        var fill = bar
+        fill.size.width = max(bar.height, bar.width * level)
         NSColor.labelColor.setFill()
-        NSBezierPath(roundedRect: fill, xRadius: bounds.height / 2, yRadius: bounds.height / 2).fill()
+        NSBezierPath(roundedRect: fill, xRadius: r, yRadius: r).fill()
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) { track(event) }
+    override func mouseDragged(with event: NSEvent) { track(event) }
+
+    private func track(_ event: NSEvent) {
+        let x = convert(event.locationInWindow, from: nil).x
+        onChange?(max(0, min(1, x / bounds.width)))
+    }
+}
+
+/// HUD background: keeps the HUD open while hovered and turns scrolling into volume changes.
+final class HUDContentView: NSVisualEffectView {
+    var onHover: ((Bool) -> Void)?
+    var onScroll: ((Double) -> Void)?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self))
+    }
+    override func mouseEntered(with event: NSEvent) { onHover?(true) }
+    override func mouseExited(with event: NSEvent) { onHover?(false) }
+    override func scrollWheel(with event: NSEvent) {
+        // Positive = wheel/fingers moved up, regardless of the "natural scrolling" setting.
+        let raw = event.isDirectionInvertedFromDevice ? -event.scrollingDeltaY : event.scrollingDeltaY
+        onScroll?(event.hasPreciseScrollingDeltas ? raw / 300 : raw / 20)
     }
 }
 
@@ -192,6 +230,7 @@ final class HUD {
     private let title = NSTextField(labelWithString: "")
     private let levelView = LevelView()
     private var hideWork: DispatchWorkItem?
+    private var hovered = false
 
     private init() {
         let size = NSSize(width: 300, height: 64)
@@ -201,10 +240,11 @@ final class HUD {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        panel.ignoresMouseEvents = true
+        panel.hidesOnDeactivate = false
+        panel.becomesKeyOnlyIfNeeded = true
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
 
-        let bg = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
+        let bg = HUDContentView(frame: NSRect(origin: .zero, size: size))
         bg.material = .hudWindow
         bg.blendingMode = .behindWindow
         bg.state = .active
@@ -217,31 +257,54 @@ final class HUD {
         icon.symbolConfiguration = .init(pointSize: 20, weight: .semibold)
         title.frame = NSRect(x: 58, y: 34, width: 226, height: 18)
         title.font = .systemFont(ofSize: 13, weight: .semibold)
-        levelView.frame = NSRect(x: 58, y: 16, width: 226, height: 8)
+        levelView.frame = NSRect(x: 58, y: 8, width: 226, height: 24) // taller than the bar for an easier grab
         [icon, title, levelView].forEach(bg.addSubview)
+
+        levelView.onChange = { [weak self] value in
+            VolumeController.shared.set(value)
+            self?.update()
+        }
+        bg.onScroll = { [weak self] delta in
+            let vc = VolumeController.shared
+            vc.set((vc.muted ? 0 : vc.volume) + delta)
+            self?.update()
+        }
+        bg.onHover = { [weak self] inside in
+            self?.hovered = inside
+            if inside { self?.hideWork?.cancel(); self?.panel.alphaValue = 1 } else { self?.scheduleHide() }
+        }
     }
 
-    func show() {
+    private func update() {
         let vc = VolumeController.shared
         let level = vc.muted ? 0 : vc.volume
         icon.image = NSImage(systemSymbolName: StatusIcon.symbol(for: level, muted: vc.muted), accessibilityDescription: nil)
         title.stringValue = vc.display.map { "\($0.name) — \(Int((level * 100).rounded()))%" } ?? ""
         levelView.level = level
+    }
 
-        if let screen = NSScreen.main {
+    func show() {
+        update()
+        if !panel.isVisible, let screen = NSScreen.main {
             let f = screen.visibleFrame
             panel.setFrameOrigin(NSPoint(x: f.maxX - panel.frame.width - 12, y: f.maxY - panel.frame.height - 12))
         }
+        panel.animator().alphaValue = 1
         panel.alphaValue = 1
         panel.orderFrontRegardless()
+        scheduleHide()
+    }
 
+    private func scheduleHide() {
         hideWork?.cancel()
-        let work = DispatchWorkItem { [panel] in
-            NSAnimationContext.runAnimationGroup({ $0.duration = 0.35; panel.animator().alphaValue = 0 },
-                                                 completionHandler: { panel.orderOut(nil) })
+        guard !hovered else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.hovered else { return }
+            NSAnimationContext.runAnimationGroup({ $0.duration = 0.35; self.panel.animator().alphaValue = 0 },
+                                                 completionHandler: { if !self.hovered { self.panel.orderOut(nil) } else { self.panel.alphaValue = 1 } })
         }
         hideWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: work)
     }
 }
 

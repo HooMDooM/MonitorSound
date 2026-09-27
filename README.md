@@ -5,8 +5,8 @@ Tiny macOS menu bar app that makes the **keyboard volume keys work for external 
 When a Mac sends audio to a monitor's built‑in speakers (or its headphone jack), macOS has no volume control for that output — the volume keys show a greyed‑out slider and do nothing. MonitorSound intercepts the volume keys and changes the volume **inside the monitor itself** using DDC/CI, the same channel the monitor's on‑screen menu uses.
 
 - 🔊 Volume Up / Down / Mute keys work again when audio goes to a monitor
-- ⌥⇧ + volume keys for fine‑grained steps (1/4 step), like stock macOS
-- On‑screen volume indicator
+- Each key press changes the volume by 5 (out of the monitor's 0–100); ⌥⇧ + volume keys for 1‑unit fine steps
+- On‑screen volume indicator — hover it to keep it open, then click/drag the bar or scroll to adjust
 - Menu bar icon with a volume slider and mute toggle
 - Starts automatically at login
 - Zero added latency — audio is not re‑routed or processed, only the monitor's own volume is changed
